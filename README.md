@@ -2,13 +2,13 @@
 
 # SpotiSpeed
 
-### A playback speed knob for the Spotify desktop app.
+### A speed knob for the Spotify desktop app.
 
-Drag it. Your music slows down or speeds up — pitch and all, like a record player.
+Drag it and your music slows down or speeds up. Pitch goes with it, like a record player.
 
 ![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D6?style=for-the-badge&logo=windows&logoColor=white)
 ![Spotify](https://img.shields.io/badge/Spotify-1.2.98-1DB954?style=for-the-badge&logo=spotify&logoColor=white)
-![Range](https://img.shields.io/badge/0.2x%20–%202.0x-purple?style=for-the-badge)
+![Range](https://img.shields.io/badge/0.2x%20to%202.0x-purple?style=for-the-badge)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey?style=for-the-badge)
 
 </div>
@@ -24,78 +24,77 @@ Drag it. Your music slows down or speeds up — pitch and all, like a record pla
                     the knob lives here
 ```
 
-**Drag up/down** to change speed · **Click** to snap back to 1x · **Scroll** for fine steps
+**Drag up/down** to change speed. **Click** to go back to 1x. **Scroll** for small steps.
 
 ---
 
-## Why this exists
+## Why
 
-Spotify has a speed control. It only works on podcasts.
+Spotify already has a speed control. It only works on podcasts.
 
-Ask the desktop app to change the speed of a *song* and the player says no, in
-those exact words:
+If you ask the desktop app to change the speed of an actual song, the player
+just says no:
 
 ```
-setSpeed(2)  →  Command failed with code '1' and reasons 'not_supported_by_content_type'
+setSpeed(2)  ->  Command failed with code '1' and reasons 'not_supported_by_content_type'
 ```
 
-That refusal comes from Spotify's native audio engine, not from the UI, so no
-amount of JavaScript gets around it. SpotiSpeed doesn't try. It sits one layer
-lower — between Spotify and your sound card — and retimes the audio on its way
-out.
+That refusal comes from Spotify's native audio code, not from the UI, so there's
+nothing you can patch in JavaScript to get around it. SpotiSpeed doesn't try. It
+sits underneath Spotify instead, between the app and your sound card, and
+retimes the audio on the way out.
 
 ---
 
 ## Install
 
-1. Download **`SpotiSpeed-Setup.bat`** from [Releases](../../releases/latest)
+1. Grab **`SpotiSpeed-Setup.bat`** from [Releases](../../releases/latest)
 2. Double click it
-3. Watch it work, press Enter when it's done
+3. Press Enter when it's finished
 
-That's it. One file, no dependencies to hunt down — it installs Spicetify for
-you if you don't have it, and starts Spotify when it's finished.
+One file, and that's all you need. If you don't have Spicetify it installs that
+too, then launches Spotify for you.
 
 <details>
-<summary><b>What the installer touches</b></summary>
+<summary><b>What it puts on your machine</b></summary>
 
 | What | Where |
 |---|---|
-| Audio engine + injector | `%LOCALAPPDATA%\SpotiSpeed\` |
-| The knob (Spicetify extension) | `%APPDATA%\spicetify\Extensions\spotispeed.js` |
-| Startup entry | Scheduled task `SpotiSpeed` (logon) |
+| Audio engine and injector | `%LOCALAPPDATA%\SpotiSpeed\` |
+| The knob (a Spicetify extension) | `%APPDATA%\spicetify\Extensions\spotispeed.js` |
+| Startup entry | `Startup\SpotiSpeed.vbs` |
 | Update blocker | `%LOCALAPPDATA%\Spotify\Update` |
 
-Nothing leaves your PC. There's no network code in this project except a
-localhost socket the knob uses to talk to the engine.
+Nothing gets uploaded anywhere. The only network code in the project is a
+localhost socket so the knob can talk to the engine.
 
 </details>
 
-**To remove it:** run `SpotiSpeed-Remove.bat`. Spotify goes back to stock.
+To get rid of it, run `SpotiSpeed-Remove.bat` and Spotify goes back to normal.
 
 ---
 
 ## Controls
 
-| Action | What it does |
+| Action | Result |
 |---|---|
-| **Drag up / down** | Change speed, `0.2x` → `2.0x` |
-| **Click** | Reset to `1x` |
-| **Scroll wheel** | Fine steps |
-| **Shift + drag/scroll** | Very fine steps |
-| **Arrow keys** | Same, when focused |
+| Drag up / down | Change speed, `0.2x` to `2.0x` |
+| Click | Reset to `1x` |
+| Scroll wheel | Small steps |
+| Shift + drag or scroll | Very small steps |
+| Arrow keys | Same thing, when focused |
 
-At exactly `1x` the engine is a mathematical no-op — the audio is bit-for-bit
-identical to stock Spotify. It only does real work when you move the knob.
+Sitting at `1x` costs you nothing. The maths works out to an exact copy, so the
+audio is identical to stock Spotify until you actually move the knob.
 
 ---
 
 ## How it works
 
-Spotify decodes music natively, inside `Spotify.dll`. The audio never reaches
-the web layer, so the usual browser trick (`audio.playbackRate`) has nothing to
-grab. What it *does* do is hand finished PCM frames to Windows through WASAPI.
-
-So that's where SpotiSpeed lives.
+Spotify decodes music natively inside `Spotify.dll`. The audio never shows up in
+the web layer at all, so the usual browser trick of setting `playbackRate` on a
+media element has nothing to attach to. What Spotify does do is hand finished
+PCM frames to Windows through WASAPI, and that part is reachable.
 
 ```mermaid
 flowchart LR
@@ -111,24 +110,24 @@ flowchart LR
     style F fill:#282828,stroke:#1ed760,color:#fff
 ```
 
-### The part that makes it actually work
+### The bit that actually makes it work
 
-Resampling alone isn't enough. If you only stretch the audio, playing at `2x`
-means you need twice as much sound per second — and Spotify is producing it at
-exactly 1x real time. You'd run dry in seconds.
+Resampling on its own isn't enough. Playing at `2x` means you need twice as much
+audio per second, and Spotify is only producing it at normal speed. You'd run
+out almost immediately.
 
-The trick is **backpressure**. WASAPI apps ask "how full is the buffer?" before
-every write, and write only what fits. SpotiSpeed answers that question itself,
-in *source* frames instead of device frames:
+The way around that is backpressure. Before every write, a WASAPI app asks how
+much room is left in the buffer, and only writes what fits. SpotiSpeed answers
+that question itself, counting in source frames rather than device frames:
 
 ```
-reported_padding = frames_still_in_my_buffer + real_device_padding × speed
+reported_padding = frames_still_in_my_buffer + real_device_padding * speed
 ```
 
-At `2x` the answer is roughly twice as large, so Spotify sees twice as much room
-and decodes twice as fast to fill it. At `0.2x` it sees almost no room and
-throttles down. Spotify's own decoder does the work of matching the rate — we
-just move the goalposts.
+At `2x` that number comes out roughly twice as big, so Spotify thinks it has
+twice as much room and decodes faster to fill it. At `0.2x` it looks nearly full,
+so Spotify slows down. Spotify's own decoder ends up doing the work of matching
+the rate. We just move the goalposts.
 
 ```mermaid
 sequenceDiagram
@@ -150,13 +149,14 @@ sequenceDiagram
 
 ### Quality
 
-Rate conversion is a 32-tap windowed sinc (Kaiser, β = 8.6, ~90 dB stopband)
-with unity-gain normalisation and a cutoff that tracks the ratio, so speeding up
-decimates without aliasing. At `1x` with an integer read cursor the kernel
-collapses to `sinc(0) = 1` and every other tap lands on a zero crossing — the
-output is the input, exactly.
+Rate conversion is a 32 tap windowed sinc (Kaiser, β = 8.6, around 90 dB
+stopband) with unity gain normalisation. The cutoff follows the ratio so
+speeding up decimates without aliasing.
 
-**Measured**, by counting frames on both sides of the resampler:
+At `1x` with an integer read cursor the kernel collapses to `sinc(0) = 1` and
+every other tap lands on a zero crossing, so the output is just the input again.
+
+Here's what it measures, counting frames on both sides of the resampler:
 
 | Knob | Measured rate | Source frames in | Device frames out |
 |:--:|:--:|--:|--:|
@@ -167,51 +167,51 @@ output is the input, exactly.
 
 ---
 
-## How I worked it out
+## How I got there
 
-I didn't start here. This is the order things fell over in.
+I didn't plan this approach. It's just what was left after everything else fell
+over, roughly in this order.
 
-**1. The web trick doesn't apply.** On `open.spotify.com`, music plays through a
-real `<video>` element and `playbackRate` just works. So I hooked
-`document.createElement` in the desktop app and played a song. Zero media
-elements captured. The Shaka player bundled in `xpui.spa` is only for video —
-music is decoded natively.
+**The web trick doesn't apply here.** On `open.spotify.com` music plays through a
+real `<video>` element, so `playbackRate` works fine. I hooked
+`document.createElement` in the desktop app to catch the equivalent, played a
+song, and caught nothing at all. The Shaka player sitting in `xpui.spa` only
+handles video. Music is decoded natively.
 
-**2. Spotify's own API refuses.** The desktop player does expose a speed method
-(`setSpeed`, renamed from `setPlaybackSpeed` somewhere along the way). Calling
-it on a track returns `not_supported_by_content_type`, and measured playback
-stayed at exactly 1.000.
+**Spotify's own API says no.** There is a speed method on the desktop player
+(`setSpeed`, previously `setPlaybackSpeed`). Call it on a track and you get
+`not_supported_by_content_type` back, and playback stays at exactly 1.000.
 
-**3. It's not an entitlement.** The account's product state had
-`speed-control = "0"`, and Spotify ships music-specific strings like
-`speed-controls.slowed-down-label`, which looked promising. I flipped the flag to
-`"1"` and confirmed it stuck. Same refusal. The gate is in native code, keyed on
-content type.
+**It isn't an account thing.** The product state had `speed-control` set to `"0"`,
+and Spotify ships music specific strings like
+`speed-controls.slowed-down-label`, which looked like a lead. I flipped the flag
+to `"1"` and checked it stuck. Same refusal. The check is in native code and
+keyed on content type.
 
-**4. It's not a feature flag either.** 1,204 remote-config properties in that
-build. Zero matching `speed`, `tempo`, `pitch`, or `slow`.
+**It isn't a feature flag either.** That build has 1,204 remote config
+properties. None of them match `speed`, `tempo`, `pitch` or `slow`.
 
-At that point the web layer was exhausted, so: hook WASAPI in-process and do it
-below Spotify entirely.
+So the web layer was a dead end, and the only thing left was to go below Spotify
+and hook WASAPI in process.
 
-**5. The bug that cost the most time.** First working hook produced silence, then
-a mysterious `0xE06D7363` — a C++ exception, thrown from inside
-`AudioSes.dll`'s `GetBuffer`. Turns out the Windows audio engine calls the
-client's *virtual* `GetCurrentPadding` from inside `GetBuffer`. That landed back
-in my own hook, which tried to take a lock it was already holding, and MSVC
-throws on that. Fix is a thread-local re-entrancy guard: while SpotiSpeed is
-driving the device, every hook steps aside and calls the original.
+**The bug that ate the most time.** My first working hook produced silence, then
+started throwing `0xE06D7363`, which is a C++ exception coming out of
+`AudioSes.dll` inside `GetBuffer`. The Windows audio engine calls the client's
+virtual `GetCurrentPadding` from in there, which lands straight back in my own
+hook, which then tries to take a lock it's already holding. MSVC throws on that.
+Fixed with a thread local re-entrancy guard, so while SpotiSpeed is driving the
+device every hook gets out of the way and calls the original.
 
-**6. The other one.** Advertising a 2x buffer via `GetBufferSize` while still
-reporting *real* padding made Spotify ask the device for more frames than it
-could hold — instant fatal error. Buffer size and padding are one contract; you
-can't fake half of it.
+**And one more.** I advertised a doubled buffer through `GetBufferSize` but was
+still returning the real padding. Spotify did the subtraction, asked the device
+for more frames than it could hold, and died on the spot. Buffer size and
+padding are one contract. You can't fake half of it.
 
 ---
 
-## Building it yourself
+## Building it
 
-Needs Visual Studio 2022 with the C++ desktop workload.
+You need Visual Studio 2022 with the C++ desktop workload.
 
 ```bat
 build.bat                                   :: -> bin\spotispeed.dll, bin\ssinject.exe
@@ -220,36 +220,36 @@ powershell -File make-installer.ps1         :: -> SpotiSpeed-Setup.bat
 
 | File | What it is |
 |---|---|
-| `src/spotispeed.cpp` | The WASAPI hook and control socket |
-| `src/resampler.h` | Windowed-sinc variable-rate resampler |
-| `src/inject.cpp` | Loads the DLL into Spotify's main process |
+| `src/spotispeed.cpp` | The WASAPI hook and the control socket |
+| `src/resampler.h` | Windowed sinc variable rate resampler |
+| `src/inject.cpp` | Gets the DLL into Spotify's main process |
 | `ext/spotispeed.js` | The knob |
-| `guardian.ps1` | Keeps it all alive across restarts |
+| `guardian.ps1` | Keeps everything alive across restarts |
 
 ---
 
-## Notes
+## Things worth knowing
 
-**Spotify can't update anymore.** That's on purpose — an update would replace the
-UI bundle and wipe the knob. The installer parks a read-only file where Spotify
-stages downloads, so the updater has nowhere to unpack. `SpotiSpeed-Remove.bat`
-undoes it.
+**Spotify can't update anymore.** This is intentional. An update swaps out the UI
+bundle and the knob disappears with it, so the installer parks a read only file
+where Spotify stages its downloads and the updater has nowhere to go.
+`SpotiSpeed-Remove.bat` puts it back.
 
-**The position counter drifts.** Spotify's own clock doesn't know the audio is
-being retimed, so the time display won't match at speeds other than 1x. The
-audio itself is correct.
+**The time counter drifts.** Spotify's clock has no idea the audio is being
+retimed, so at anything other than 1x the position display won't line up. The
+audio is still correct.
 
-**Built and tested against Spotify 1.2.98.300 on Windows 11, x64.** The hook
-targets standard shared-mode WASAPI rather than anything Spotify-specific, so it
-should survive minor version bumps — but the knob depends on Spicetify
-supporting your build.
+**Tested on Spotify 1.2.98.300, Windows 11, x64.** The hook targets ordinary
+shared mode WASAPI rather than anything specific to Spotify, so small version
+bumps should be fine. The knob is the fragile part, since it needs Spicetify to
+support your build.
 
-**Antivirus may complain.** It injects a DLL into another process, which looks
-exactly like something you'd want your AV to flag. Source is all here; build it
-yourself if you'd rather not trust a binary.
+**Antivirus might not like it.** It injects a DLL into another process, which is
+exactly the behaviour AV is built to catch. All the source is here if you'd
+rather compile it yourself than trust a binary.
 
 ---
 
 ## License
 
-MIT — do what you like with it.
+MIT. Do whatever you want with it.
