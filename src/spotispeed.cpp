@@ -80,6 +80,8 @@ struct Stream {
     std::vector<float> ingest;    // format-conversion scratch
     Resampler rs;
     bool   active     = false;
+    int    faults     = 0;       // consecutive faults in the pump
+    bool   faulted    = false;   // this stream gave up; others keep working
 };
 
 static std::recursive_mutex g_mtx;
@@ -172,8 +174,10 @@ static double clampSpeed(double s) {
 // advertised buffer size and the virtual padding are a single contract, and
 // Spotify caches the buffer size at initialise time. Disabling therefore just
 // pins the rate to 1.0 (bit-exact) rather than changing the contract.
-static double effectiveSpeed() {
-    return g_enabled.load() ? clampSpeed(g_speed.load()) : 1.0;
+static double speedFor(Stream* st) {
+    if (!g_enabled.load()) return 1.0;
+    if (st != NULL && st->faulted) return 1.0;   // only this stream stands down
+    return clampSpeed(g_speed.load());
 }
 
 // ------------------------------------------------------------------- hooks --
@@ -207,7 +211,17 @@ static HRESULT STDMETHODCALLTYPE h_Initialize(IAudioClient* self, AUDCLNT_SHAREM
 
     std::lock_guard<std::recursive_mutex> lk(g_mtx);
     std::unordered_map<IAudioClient*, Stream*>::iterator it = g_byClient.find(self);
-    if (it != g_byClient.end()) delete it->second;
+    if (it != g_byClient.end()) {
+        // Drop every render-client entry that pointed at the old stream before
+        // freeing it. COM recycles addresses, so a leftover mapping here means a
+        // later GetBuffer/ReleaseBuffer would run against freed memory.
+        Stream* old = it->second;
+        for (std::unordered_map<IAudioRenderClient*, Stream*>::iterator r = g_byRender.begin();
+             r != g_byRender.end(); ) {
+            if (r->second == old) r = g_byRender.erase(r); else ++r;
+        }
+        delete old;
+    }
     g_byClient[self] = st;
     logf("[SS] init client=%p ch=%d bits=%d flt=%d devBuf=%u evt=%d\n",
          (void*)self, st->channels, st->bits, (int)st->isFloat, bufFrames,
@@ -253,7 +267,7 @@ static HRESULT STDMETHODCALLTYPE h_GetCurrentPadding(IAudioClient* self, UINT32*
     std::unordered_map<IAudioClient*, Stream*>::iterator it = g_byClient.find(self);
     if (it == g_byClient.end() || !it->second->active) { *pn = realPad; return hr; }
     Stream* st = it->second;
-    const double sp = effectiveSpeed();
+    const double sp = speedFor(st);
 
     double queued = st->rs.pending() + (double)realPad * sp;
     if (queued < 0) queued = 0;
@@ -339,10 +353,18 @@ static HRESULT pumpBody(Stream* st, UINT32 frames, DWORD flags, double sp) {
 
 // No C++ objects in this frame, so SEH is legal: never let a fault reach Spotify.
 static HRESULT pumpSafe(Stream* st, UINT32 frames, DWORD flags, double sp) {
-    __try { return pumpBody(st, frames, flags, sp); }
+    __try {
+        HRESULT hr = pumpBody(st, frames, flags, sp);
+        st->faults = 0;                 // a clean pass clears the streak
+        return hr;
+    }
     __except (EXCEPTION_EXECUTE_HANDLER) {
-        logf("[SS] !! fault 0x%08lX in pump\n", (unsigned long)GetExceptionCode());
-        g_enabled.store(false);   // fail safe: pin to 1.0x, audio keeps playing
+        logf("[SS] !! fault 0x%08lX in pump (streak %d)\n",
+             (unsigned long)GetExceptionCode(), st->faults + 1);
+        // Tolerate the odd hiccup. Only if a stream keeps faulting do we stand
+        // down, and only for that stream - a stale one must never disable the
+        // whole engine for the rest of the process's life.
+        if (++st->faults >= 8) st->faulted = true;
         return S_OK;
     }
 }
@@ -356,7 +378,7 @@ static HRESULT STDMETHODCALLTYPE h_ReleaseBuffer(IAudioRenderClient* self, UINT3
         return o_ReleaseBuffer(self, frames, flags);
     }
     Stream* st = it->second;
-    return pumpSafe(st, frames, flags, effectiveSpeed());
+    return pumpSafe(st, frames, flags, speedFor(st));
 }
 
 static HRESULT STDMETHODCALLTYPE h_Stop(IAudioClient* self) {
@@ -464,14 +486,21 @@ static DWORD WINAPI serverThread(LPVOID) {
                 const char* v = strstr(buf, "v=");
                 if (v != NULL) g_enabled.store(atoi(v + 2) == 0);
             }
-            int streams = 0;
-            { std::lock_guard<std::recursive_mutex> lk(g_mtx); streams = (int)g_byRender.size(); }
-            char body[256];
+            int streams = 0, faulted = 0;
+            {
+                std::lock_guard<std::recursive_mutex> lk(g_mtx);
+                streams = (int)g_byRender.size();
+                for (std::unordered_map<IAudioRenderClient*, Stream*>::iterator r = g_byRender.begin();
+                     r != g_byRender.end(); ++r) {
+                    if (r->second != NULL && r->second->faulted) ++faulted;
+                }
+            }
+            char body[320];
             int bl = _snprintf_s(body, sizeof(body), _TRUNCATE,
                 "{\"ok\":true,\"speed\":%.4f,\"enabled\":%s,\"min\":%.2f,\"max\":%.2f,"
-                "\"hooked\":%s,\"streams\":%d,\"src\":%lld,\"out\":%lld}",
+                "\"hooked\":%s,\"streams\":%d,\"faulted\":%d,\"src\":%lld,\"out\":%lld}",
                 g_speed.load(), g_enabled.load() ? "true" : "false", kMinSpeed, kMaxSpeed,
-                (o_ReleaseBuffer != NULL) ? "true" : "false", streams,
+                (o_ReleaseBuffer != NULL) ? "true" : "false", streams, faulted,
                 g_srcFrames.load(), g_outFrames.load());
             char hdr[384];
             int hl = _snprintf_s(hdr, sizeof(hdr), _TRUNCATE,
@@ -488,11 +517,18 @@ static DWORD WINAPI serverThread(LPVOID) {
 }
 
 static DWORD WINAPI initThread(LPVOID) {
-    for (int i = 0; i < 60; ++i) {
-        if (installHooks()) break;
-        Sleep(500);
-    }
+    // Start the control server first so the knob can always see us, even while
+    // the hooks are still coming up.
     CreateThread(NULL, 0, serverThread, NULL, 0, NULL);
+
+    // Keep trying forever. Right after the machine wakes from sleep the default
+    // audio endpoint can be missing for a while; giving up after a fixed number
+    // of tries would leave the engine loaded but permanently deaf.
+    int tries = 0;
+    while (!installHooks()) {
+        ++tries;
+        Sleep(tries < 60 ? 500 : 5000);
+    }
     return 0;
 }
 

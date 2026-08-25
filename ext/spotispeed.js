@@ -47,6 +47,25 @@
         if (root) root.title = up ? tip() : "SpotiSpeed engine not running";
     }
 
+    // The engine is a fresh process every time Spotify restarts, so it always
+    // comes up at 1x, and it usually comes up a few seconds AFTER the knob does.
+    // Without this the knob would keep showing the remembered speed while the
+    // audio played at 1x. Whenever the engine appears, or its speed drifts from
+    // what the knob shows, send ours again.
+    function reconcile(j) {
+        var wasUp = engineUp;
+        setEngine(true);
+        var theirs = (j && typeof j.speed === "number") ? j.speed : 1;
+        if (!wasUp || Math.abs(theirs - speed) > 0.005) push(speed);
+    }
+
+    function poll() {
+        fetch("http://127.0.0.1:" + PORT + "/speed", { cache: "no-store" })
+            .then(function (r) { return r.json(); })
+            .then(reconcile)
+            .catch(function () { setEngine(false); });
+    }
+
     function tip() { return "Playback speed " + speed.toFixed(2) + "x - drag to change, click to reset"; }
 
     // ------------------------------------------------------------------- ui --
@@ -232,12 +251,14 @@
         // Spotify re-renders the footer; put the knob back when it does.
         var obs = new MutationObserver(function () { mount(); });
         obs.observe(document.body, { childList: true, subtree: true });
-        setInterval(function () {
-            fetch("http://127.0.0.1:" + PORT + "/speed", { cache: "no-store" })
-                .then(function (r) { return r.json(); })
-                .then(function () { setEngine(true); })
-                .catch(function () { setEngine(false); });
-        }, 5000);
+        poll();
+        setInterval(poll, 2000);
+        // Waking from sleep, or Spotify being backgrounded, can stall timers;
+        // check as soon as the window is looked at again.
+        document.addEventListener("visibilitychange", function () {
+            if (!document.hidden) poll();
+        });
+        window.addEventListener("focus", poll);
     }
 
     boot();

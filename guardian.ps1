@@ -10,6 +10,11 @@
 
 $ErrorActionPreference = 'SilentlyContinue'
 
+# One guardian per session. Re-running the installer, or logging back in without
+# a full reboot, would otherwise leave several copies fighting over the same files.
+$mutex = New-Object System.Threading.Mutex($false, 'Local\SpotiSpeedGuardian')
+if (-not $mutex.WaitOne(0)) { exit }
+
 $Home_    = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Dll      = Join-Path $Home_ 'spotispeed.dll'
 $Inject   = Join-Path $Home_ 'ssinject.exe'
