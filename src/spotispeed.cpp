@@ -277,11 +277,36 @@ static HRESULT STDMETHODCALLTYPE h_GetCurrentPadding(IAudioClient* self, UINT32*
     return hr;
 }
 
+// If we were injected after Spotify had already opened its audio stream we
+// never saw Initialize, so we hold no format or buffer information for it and
+// the knob would silently do nothing. We cannot safely adopt such a stream, but
+// we can ask Spotify to build a new one: AUDCLNT_E_DEVICE_INVALIDATED is the
+// ordinary "your endpoint went away" signal that every WASAPI client must
+// already handle for device switching. Spotify tears the stream down, calls
+// Initialize again, and that time we are listening.
+//
+// Done at most once per process, and only while we have no working stream at
+// all, so a normal session never sees it.
+static std::atomic<bool> g_recoveryUsed(false);
+
+static bool shouldForceRebuild() {
+    if (g_recoveryUsed.load()) return false;
+    if (!g_byRender.empty()) return false;      // something is already working
+    if (o_ReleaseBuffer == NULL) return false;  // hooks not up yet, just wait
+    g_recoveryUsed.store(true);
+    logf("[SS] untracked stream, asking Spotify to rebuild it\n");
+    return true;
+}
+
 static HRESULT STDMETHODCALLTYPE h_GetBuffer(IAudioRenderClient* self, UINT32 frames, BYTE** ppData) {
     if (g_reentry) return o_GetBuffer(self, frames, ppData);
     std::unique_lock<std::recursive_mutex> lk(g_mtx);
     std::unordered_map<IAudioRenderClient*, Stream*>::iterator it = g_byRender.find(self);
     if (it == g_byRender.end() || !it->second->active) {
+        if (it == g_byRender.end() && shouldForceRebuild()) {
+            lk.unlock();
+            return AUDCLNT_E_DEVICE_INVALIDATED;
+        }
         lk.unlock();
         return o_GetBuffer(self, frames, ppData);
     }

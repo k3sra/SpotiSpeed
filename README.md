@@ -60,9 +60,9 @@ too, then launches Spotify for you.
 
 | What | Where |
 |---|---|
-| Audio engine and injector | `%LOCALAPPDATA%\SpotiSpeed\` |
+| Audio engine and watcher | `%LOCALAPPDATA%\SpotiSpeed\` |
 | The knob (a Spicetify extension) | `%APPDATA%\spicetify\Extensions\spotispeed.js` |
-| Startup entry | `Startup\SpotiSpeed.vbs` |
+| Autostart | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` → `SpotiSpeed` |
 | Update blocker | `%LOCALAPPDATA%\Spotify\Update` |
 
 Nothing gets uploaded anywhere. The only network code in the project is a
@@ -222,9 +222,13 @@ powershell -File make-installer.ps1         :: -> SpotiSpeed-Setup.bat
 |---|---|
 | `src/spotispeed.cpp` | The WASAPI hook and the control socket |
 | `src/resampler.h` | Windowed sinc variable rate resampler |
-| `src/inject.cpp` | Gets the DLL into Spotify's main process |
+| `src/inject.cpp` | The watcher: injects the DLL, blocks updates, keeps its own autostart |
 | `ext/spotispeed.js` | The knob |
-| `guardian.ps1` | Keeps everything alive across restarts |
+
+The watcher is one native windowless process launched from the Run key. It used
+to be a Startup-folder script launching PowerShell launching the injector, and
+that chain silently failed to run on at least one machine, which left the knob
+dead after a reboot. Fewer links, fewer things to break.
 
 ---
 

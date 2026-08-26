@@ -19,6 +19,7 @@ if errorlevel 1 ( echo [!] DLL build FAILED & exit /b 1 )
 echo [*] compiling injector
 cl /nologo /O2 /EHsc /MT /std:c++17 /DNOMINMAX /DWIN32_LEAN_AND_MEAN ^
    /Fe:bin\ssinject.exe /Fo:bin\ /Fd:bin\ ^
-   src\inject.cpp /link /OUT:bin\ssinject.exe user32.lib shlwapi.lib
+   src\inject.cpp /link /OUT:bin\ssinject.exe /SUBSYSTEM:WINDOWS ^
+   user32.lib shlwapi.lib shell32.lib advapi32.lib ole32.lib
 if errorlevel 1 ( echo [!] injector build FAILED & exit /b 1 )
 echo [+] build OK
