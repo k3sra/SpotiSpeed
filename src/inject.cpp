@@ -36,6 +36,29 @@ static void say(const wchar_t* fmt, ...) {
     fflush(stdout);
 }
 
+// Persistent log. The watcher runs with no window, so without this there is no
+// way to find out why an injection did not happen.
+static void wlog(const char* fmt, ...) {
+    char path[MAX_PATH];
+    if (!ExpandEnvironmentStringsA("%LOCALAPPDATA%\\SpotiSpeed\\watcher.log", path, MAX_PATH)) return;
+
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (GetFileAttributesExA(path, GetFileExInfoStandard, &fad) &&
+        fad.nFileSizeLow > 256 * 1024) {
+        DeleteFileA(path);   // keep it small; this is a rolling breadcrumb trail
+    }
+    FILE* f = NULL;
+    if (fopen_s(&f, path, "a") != 0 || f == NULL) return;
+
+    SYSTEMTIME t; GetLocalTime(&t);
+    fprintf(f, "%02d:%02d:%02d ", t.wHour, t.wMinute, t.wSecond);
+    va_list ap; va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fclose(f);
+}
+
 static std::wstring envPath(const wchar_t* var, const wchar_t* tail) {
     wchar_t buf[MAX_PATH] = { 0 };
     if (GetEnvironmentVariableW(var, buf, MAX_PATH) == 0) return L"";
@@ -96,26 +119,48 @@ static bool injectInto(DWORD pid, const wchar_t* dllPath) {
     HANDLE p = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION |
                            PROCESS_VM_OPERATION  | PROCESS_VM_WRITE | PROCESS_VM_READ,
                            FALSE, pid);
-    if (p == NULL) { say(L"      OpenProcess failed (%lu)\n", GetLastError()); return false; }
+    if (p == NULL) {
+        DWORD e = GetLastError();
+        say(L"      OpenProcess failed (%lu)\n", e);
+        wlog("inject pid=%lu: OpenProcess failed err=%lu", pid, e);
+        return false;
+    }
 
     const SIZE_T bytes = (wcslen(dllPath) + 1) * sizeof(wchar_t);
     void* remote = VirtualAllocEx(p, NULL, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (remote == NULL) { say(L"      VirtualAllocEx failed (%lu)\n", GetLastError()); CloseHandle(p); return false; }
+    if (remote == NULL) {
+        DWORD e = GetLastError();
+        say(L"      VirtualAllocEx failed (%lu)\n", e);
+        wlog("inject pid=%lu: VirtualAllocEx failed err=%lu", pid, e);
+        CloseHandle(p);
+        return false;
+    }
 
     bool ok = false;
     if (!WriteProcessMemory(p, remote, dllPath, bytes, NULL)) {
-        say(L"      WriteProcessMemory failed (%lu)\n", GetLastError());
+        DWORD e = GetLastError();
+        say(L"      WriteProcessMemory failed (%lu)\n", e);
+        wlog("inject pid=%lu: WriteProcessMemory failed err=%lu", pid, e);
     } else {
         HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
         FARPROC loadLib = GetProcAddress(k32, "LoadLibraryW");
         HANDLE th = CreateRemoteThread(p, NULL, 0, (LPTHREAD_START_ROUTINE)loadLib, remote, 0, NULL);
         if (th == NULL) {
-            say(L"      CreateRemoteThread failed (%lu)\n", GetLastError());
+            DWORD e = GetLastError();
+            say(L"      CreateRemoteThread failed (%lu)\n", e);
+            wlog("inject pid=%lu: CreateRemoteThread failed err=%lu%s", pid, e,
+                 e == ERROR_ACCESS_DENIED ? " (blocked by security software)" : "");
         } else {
             DWORD w = WaitForSingleObject(th, 15000);
             DWORD code = 0; GetExitCodeThread(th, &code);
             ok = (w == WAIT_OBJECT_0 && code != 0);
-            if (!ok) say(L"      LoadLibraryW returned %lu (wait=%lu)\n", code, w);
+            if (!ok) {
+                say(L"      LoadLibraryW returned %lu (wait=%lu)\n", code, w);
+                wlog("inject pid=%lu: LoadLibraryW returned %lu wait=%lu (0 = target refused the load)",
+                     pid, code, w);
+            } else {
+                wlog("inject pid=%lu: OK", pid);
+            }
             CloseHandle(th);
         }
     }
@@ -129,9 +174,23 @@ static bool injectInto(DWORD pid, const wchar_t* dllPath) {
 // on that path means the directory can never be created, so the updater has
 // nowhere to unpack and gives up. An update would replace the UI bundle and
 // take the knob with it.
+// A read-only file was not enough: Spotify's updater simply cleared the
+// attribute and deleted it, then updated and wiped the knob. So we create the
+// file and HOLD IT OPEN with no sharing for as long as the watcher lives.
+// Windows will not let anyone delete, rename or open a file that is held with
+// dwShareMode = 0, so the updater has nowhere to unpack and gives up.
+static HANDLE g_updGuard = INVALID_HANDLE_VALUE;
+
 static void blockUpdates() {
     std::wstring upd = envPath(L"LOCALAPPDATA", L"\\Spotify\\Update");
     if (upd.empty()) return;
+
+    if (g_updGuard != INVALID_HANDLE_VALUE) {
+        if (GetFileAttributesW(upd.c_str()) != INVALID_FILE_ATTRIBUTES) return;  // still holding
+        CloseHandle(g_updGuard);
+        g_updGuard = INVALID_HANDLE_VALUE;
+        wlog("update blocker was lost, re-arming");
+    }
 
     DWORD attr = GetFileAttributesW(upd.c_str());
     if (attr != INVALID_FILE_ATTRIBUTES) {
@@ -143,15 +202,15 @@ static void blockUpdates() {
             op.fFlags = FOF_NO_UI | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI;
             SHFileOperationW(&op);
         } else {
-            return;   // already a file; nothing to do
+            SetFileAttributesW(upd.c_str(), FILE_ATTRIBUTE_NORMAL);
+            DeleteFileW(upd.c_str());
         }
     }
-    HANDLE h = CreateFileW(upd.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
-                           FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h != INVALID_HANDLE_VALUE) {
-        CloseHandle(h);
-        SetFileAttributesW(upd.c_str(), FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN);
-    }
+
+    g_updGuard = CreateFileW(upd.c_str(), GENERIC_WRITE, 0 /* deny all sharing */, NULL,
+                             CREATE_ALWAYS, FILE_ATTRIBUTE_HIDDEN, NULL);
+    if (g_updGuard != INVALID_HANDLE_VALUE) wlog("update blocker armed (exclusive handle held)");
+    else wlog("update blocker FAILED err=%lu", GetLastError());
 }
 
 // Put ourselves back in Run if anything clears it. Same mechanism Spotify uses
@@ -179,13 +238,23 @@ static void ensureAutostart(const wchar_t* exePath, const wchar_t* dllPath) {
 // If Spotify ever replaces its UI bundle, the knob is gone until Spicetify is
 // re-applied. Only done while Spotify is closed so we never yank it out from
 // under the user mid-song.
-static void ensureKnob() {
+// Does Spotify's UI bundle still carry the knob?
+//
+// After Spicetify patches, Apps/ holds extracted xpui/ and login/ folders and
+// no .spa archives. When Spotify updates it drops fresh xpui.spa back in, so
+// the mere presence of that archive means a new, unpatched bundle has landed.
+// The old check only looked at index.html and bailed out when the folder was
+// missing, which is exactly the post-update state - so it never repaired.
+static bool needsKnobRepair() {
+    std::wstring spa = envPath(L"APPDATA", L"\\Spotify\\Apps\\xpui.spa");
+    if (!spa.empty() && PathFileExistsW(spa.c_str())) return true;
+
     std::wstring index = envPath(L"APPDATA", L"\\Spotify\\Apps\\xpui\\index.html");
-    if (index.empty()) return;
+    if (index.empty() || !PathFileExistsW(index.c_str())) return false;
+
     HANDLE h = CreateFileW(index.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
                            NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) return;          // still a packed .spa
-
+    if (h == INVALID_HANDLE_VALUE) return false;
     char buf[8192]; DWORD got = 0;
     bool patched = false;
     if (ReadFile(h, buf, sizeof(buf) - 1, &got, NULL) && got > 0) {
@@ -193,22 +262,48 @@ static void ensureKnob() {
         patched = (strstr(buf, "spicetifyWrapper") != NULL);
     }
     CloseHandle(h);
-    if (patched) return;
+    return !patched;
+}
 
-    std::wstring spice = envPath(L"LOCALAPPDATA", L"\\spicetify\\spicetify.exe");
-    if (spice.empty() || !PathFileExistsW(spice.c_str())) return;
-
-    std::wstring cmd = L"\"" + spice + L"\" backup apply";
+static bool runHidden(const std::wstring& cmd, DWORD waitMs) {
     STARTUPINFOW si; ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si);
     si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
     PROCESS_INFORMATION pi; ZeroMemory(&pi, sizeof(pi));
     std::vector<wchar_t> mutableCmd(cmd.begin(), cmd.end());
     mutableCmd.push_back(0);
-    if (CreateProcessW(NULL, mutableCmd.data(), NULL, NULL, FALSE,
-                       CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-        WaitForSingleObject(pi.hProcess, 120000);
-        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    if (!CreateProcessW(NULL, mutableCmd.data(), NULL, NULL, FALSE,
+                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) return false;
+    WaitForSingleObject(pi.hProcess, waitMs);
+    CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    return true;
+}
+
+// Re-apply Spicetify after Spotify replaces its bundle. Only ever called while
+// Spotify is closed, so we never pull the UI out from under a playing track.
+static void ensureKnob() {
+    if (!needsKnobRepair()) return;
+    wlog("Spotify replaced its UI bundle - re-applying the knob");
+
+    std::wstring spice = envPath(L"LOCALAPPDATA", L"\\spicetify\\spicetify.exe");
+    if (spice.empty() || !PathFileExistsW(spice.c_str())) {
+        wlog("cannot repair: spicetify.exe not found");
+        return;
     }
+
+    // "backup apply" refuses if a stale backup of the previous version is still
+    // sitting there ("Failed to clear current backup"), so clear it ourselves.
+    std::wstring backup = envPath(L"APPDATA", L"\\spicetify\\Backup");
+    if (!backup.empty() && PathFileExistsW(backup.c_str())) {
+        SHFILEOPSTRUCTW op; ZeroMemory(&op, sizeof(op));
+        std::wstring from = backup; from.push_back(L'\0'); from.push_back(L'\0');
+        op.wFunc = FO_DELETE;
+        op.pFrom = from.c_str();
+        op.fFlags = FOF_NO_UI | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI;
+        SHFileOperationW(&op);
+    }
+
+    runHidden(L"\"" + spice + L"\" backup apply", 180000);
+    wlog(needsKnobRepair() ? "re-apply did not take" : "knob restored");
 }
 
 // ------------------------------------------------------------------- main --
@@ -247,7 +342,11 @@ static int run(int argc, wchar_t** argv) {
     }
 
     HANDLE once_ = CreateMutexW(NULL, TRUE, L"Local\\SpotiSpeedWatcher");
-    if (once_ != NULL && GetLastError() == ERROR_ALREADY_EXISTS) return 0;
+    if (once_ != NULL && GetLastError() == ERROR_ALREADY_EXISTS) {
+        wlog("another watcher is already running; exiting");
+        return 0;
+    }
+    wlog("watcher started");
 
     DWORD lastPid = 0;
     int   failures = 0, tick = 0;
@@ -266,7 +365,7 @@ static int run(int argc, wchar_t** argv) {
             Sleep(250);
             continue;
         }
-        if (pid != lastPid) { lastPid = pid; failures = 0; }
+        if (pid != lastPid) { lastPid = pid; failures = 0; wlog("spotify main pid=%lu", pid); }
 
         if (!alreadyLoaded(pid, name)) {
             if (injectInto(pid, dll.c_str())) failures = 0;
