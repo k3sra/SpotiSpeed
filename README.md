@@ -65,6 +65,11 @@ too, then launches Spotify for you.
 | Autostart | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` → `SpotiSpeed` |
 | Update blocker | `%LOCALAPPDATA%\Spotify\Update` |
 
+It also sets up [Spicetify Marketplace](https://github.com/spicetify/marketplace)
+while it is in there, so you get the shop icon in the sidebar and can install
+other themes and extensions. Adding the knob appends to your Spicetify config
+rather than replacing it, so anything you already had stays put.
+
 Nothing gets uploaded anywhere. The only network code in the project is a
 localhost socket so the knob can talk to the engine.
 

@@ -76,6 +76,27 @@ New-Item -ItemType Directory -Force $HOME_ | Out-Null
 Remove-Item (Join-Path $HOME_ 'guardian.ps1') -Force -ErrorAction SilentlyContinue
 Ok "Engine installed to $HOME_"
 
+# --- 4b. Marketplace (the shop icon, for installing other plugins) ----------
+# Optional and non-fatal: if it does not work out, the knob is unaffected.
+$MKT = Join-Path $env:APPDATA 'spicetify\CustomApps\marketplace'
+try {
+    if (-not (Test-Path (Join-Path $MKT 'manifest.json'))) {
+        Say '[*] Installing Spicetify Marketplace (the shop icon)...'
+        $prev = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
+        Invoke-WebRequest -UseBasicParsing `
+            'https://raw.githubusercontent.com/spicetify/marketplace/main/resources/install.ps1' |
+            Invoke-Expression
+        $ProgressPreference = $prev
+    }
+    if (Test-Path (Join-Path $MKT 'manifest.json')) {
+        # list-type config: this appends, it never clears what is already there
+        & $SPICE config custom_apps marketplace 2>&1 | Out-Null
+        Ok 'Marketplace ready (shop icon in the sidebar)'
+    } else {
+        Warn 'Marketplace not installed - the knob still works, you just will not get the shop icon'
+    }
+} catch { Warn "Marketplace step skipped: $($_.Exception.Message)" }
+
 # --- 5. the knob -----------------------------------------------------------
 Say "[*] Adding the knob to Spotify's footer..."
 New-Item -ItemType Directory -Force $EXTDIR | Out-Null
