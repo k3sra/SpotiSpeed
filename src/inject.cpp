@@ -23,6 +23,7 @@
 #include <string>
 #include <vector>
 #include <set>
+#include <map>
 
 #pragma comment(lib, "shlwapi.lib")
 
@@ -70,29 +71,70 @@ static std::wstring envPath(const wchar_t* var, const wchar_t* tail) {
 // Spotify.exe. Helpers (renderer, gpu, utility, crashpad) are all its children.
 // Deliberately does not look for a window: waiting for the UI to appear loses
 // the race against Spotify opening its audio stream.
-static DWORD findMainSpotify() {
+// There can be more than one independent Spotify tree at once - most often a
+// leftover elevated instance sitting next to the normal one. Parentage cannot
+// tell them apart, and committing to the wrong root means retrying a process we
+// are not allowed to open (ACCESS_DENIED) forever while the Spotify the user is
+// actually listening to never gets hooked. So return every plausible browser
+// process, the one owning a visible window first, and try them all.
+
+static BOOL CALLBACK collectWindowPids(HWND hwnd, LPARAM lp) {
+    std::set<DWORD>* out = (std::set<DWORD>*)lp;
+    if (!IsWindowVisible(hwnd)) return TRUE;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == 0) return TRUE;
+
+    HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (p == NULL) return TRUE;
+    wchar_t path[MAX_PATH] = { 0 };
+    DWORD n = MAX_PATH;
+    if (QueryFullProcessImageNameW(p, 0, path, &n) &&
+        _wcsicmp(PathFindFileNameW(path), L"Spotify.exe") == 0) {
+        out->insert(pid);
+    }
+    CloseHandle(p);
+    return TRUE;
+}
+
+static std::vector<DWORD> findSpotifyTargets() {
+    std::vector<DWORD> targets;
+    std::set<DWORD> pids, taken;
+    std::vector<std::pair<DWORD, DWORD> > all;   // pid, parent
+
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snap == INVALID_HANDLE_VALUE) return 0;
-
-    struct Ent { DWORD pid, parent; };
-    std::vector<Ent> spotify;
-    std::set<DWORD>  pids;
-
+    if (snap == INVALID_HANDLE_VALUE) return targets;
     PROCESSENTRY32W pe; pe.dwSize = sizeof(pe);
     if (Process32FirstW(snap, &pe)) {
         do {
             if (_wcsicmp(pe.szExeFile, L"Spotify.exe") == 0) {
-                Ent e; e.pid = pe.th32ProcessID; e.parent = pe.th32ParentProcessID;
-                spotify.push_back(e);
+                all.push_back(std::make_pair(pe.th32ProcessID, pe.th32ParentProcessID));
                 pids.insert(pe.th32ProcessID);
             }
         } while (Process32NextW(snap, &pe));
     }
     CloseHandle(snap);
+    if (all.empty()) return targets;
 
-    for (size_t i = 0; i < spotify.size(); ++i)
-        if (pids.find(spotify[i].parent) == pids.end()) return spotify[i].pid;
-    return spotify.empty() ? 0 : spotify[0].pid;
+    // the instance the user can actually see comes first
+    std::set<DWORD> windowed;
+    EnumWindows(collectWindowPids, (LPARAM)&windowed);
+    for (std::set<DWORD>::iterator w = windowed.begin(); w != windowed.end(); ++w)
+        if (pids.count(*w) && !taken.count(*w)) { targets.push_back(*w); taken.insert(*w); }
+
+    // then every tree root: a Spotify.exe not spawned by another Spotify.exe
+    for (size_t i = 0; i < all.size(); ++i)
+        if (!pids.count(all[i].second) && !taken.count(all[i].first)) {
+            targets.push_back(all[i].first);
+            taken.insert(all[i].first);
+        }
+    return targets;
+}
+
+// kept for the housekeeping checks that only need "is Spotify running at all"
+static DWORD findMainSpotify() {
+    std::vector<DWORD> t = findSpotifyTargets();
+    return t.empty() ? 0 : t[0];
 }
 
 static bool alreadyLoaded(DWORD pid, const wchar_t* dllName) {
@@ -161,6 +203,32 @@ static bool injectInto(DWORD pid, const wchar_t* dllPath) {
             } else {
                 wlog("inject pid=%lu: OK", pid);
             }
+            CloseHandle(th);
+        }
+    }
+    VirtualFreeEx(p, remote, 0, MEM_RELEASE);
+    CloseHandle(p);
+    return ok;
+}
+
+// Same attempt, but says nothing. Used once a process has proved it will not
+// let us in, so the log stays readable.
+static bool injectQuiet(DWORD pid, const wchar_t* dllPath) {
+    HANDLE p = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION |
+                           PROCESS_VM_OPERATION  | PROCESS_VM_WRITE | PROCESS_VM_READ,
+                           FALSE, pid);
+    if (p == NULL) return false;
+    const SIZE_T bytes = (wcslen(dllPath) + 1) * sizeof(wchar_t);
+    void* remote = VirtualAllocEx(p, NULL, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (remote == NULL) { CloseHandle(p); return false; }
+    bool ok = false;
+    if (WriteProcessMemory(p, remote, dllPath, bytes, NULL)) {
+        FARPROC loadLib = GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW");
+        HANDLE th = CreateRemoteThread(p, NULL, 0, (LPTHREAD_START_ROUTINE)loadLib, remote, 0, NULL);
+        if (th != NULL) {
+            DWORD w = WaitForSingleObject(th, 15000);
+            DWORD code = 0; GetExitCodeThread(th, &code);
+            ok = (w == WAIT_OBJECT_0 && code != 0);
             CloseHandle(th);
         }
     }
@@ -348,8 +416,9 @@ static int run(int argc, wchar_t** argv) {
     }
     wlog("watcher started");
 
-    DWORD lastPid = 0;
-    int   failures = 0, tick = 0;
+    // pid -> attempt count, or -1 once that process is loaded / done with
+    std::map<DWORD, int> seen;
+    int tick = 0;
     for (;;) {
         // housekeeping roughly every 30 seconds
         if (tick % 120 == 0) {
@@ -359,24 +428,42 @@ static int run(int argc, wchar_t** argv) {
         }
         ++tick;
 
-        DWORD pid = findMainSpotify();
-        if (pid == 0) {
-            lastPid = 0; failures = 0;
+        std::vector<DWORD> targets = findSpotifyTargets();
+        if (targets.empty()) {
+            seen.clear();
             Sleep(250);
             continue;
         }
-        if (pid != lastPid) { lastPid = pid; failures = 0; wlog("spotify main pid=%lu", pid); }
 
-        if (!alreadyLoaded(pid, name)) {
-            if (injectInto(pid, dll.c_str())) failures = 0;
-            else ++failures;
-            // Never stop trying. A refusal right after the machine wakes should
-            // heal on its own, without the user doing anything.
-            Sleep(failures > 20 ? 3000 : 250);
-        } else {
-            failures = 0;
-            Sleep(250);
+        bool anyPending = false;
+        for (size_t i = 0; i < targets.size(); ++i) {
+            const DWORD pid = targets[i];
+            if (seen.find(pid) == seen.end()) {
+                seen[pid] = 0;
+                wlog("spotify process pid=%lu", pid);
+            }
+            if (alreadyLoaded(pid, name)) { seen[pid] = -1; continue; }   // -1 = done
+
+            if (seen[pid] < 0) continue;
+            // An instance we are not allowed to open (an elevated one, say) must
+            // never stall the instance we can. Keep retrying it in case it
+            // restarts unelevated, but slow down and stop filling the log.
+            const int tries = seen[pid];
+            if (tries > 5 && (tick % 120) != 0) { anyPending = true; continue; }
+
+            const bool quiet = (tries >= 3);
+            const bool done  = quiet ? injectQuiet(pid, dll.c_str())
+                                     : injectInto(pid, dll.c_str());
+            if (done) {
+                seen[pid] = -1;
+                wlog("inject pid=%lu: OK", pid);
+            } else {
+                if (tries == 2) wlog("inject pid=%lu: still refusing, will keep retrying quietly", pid);
+                ++seen[pid];
+                anyPending = true;
+            }
         }
+        Sleep(anyPending ? 1000 : 250);
     }
 }
 
