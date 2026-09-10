@@ -7,6 +7,16 @@
 (function SpotiSpeed() {
     "use strict";
 
+    // Guard against being loaded more than once. The CDP injector re-evaluates
+    // this file on every reconnect, and each closure would otherwise stand up
+    // its own knob and its own 2s poll loop - two knobs fighting each other
+    // over the engine's speed value.
+    if (window.__spotispeedLoaded) return;
+    window.__spotispeedLoaded = true;
+    // wipe any stale knob nodes an earlier load left behind
+    var stale = document.querySelectorAll(".ss-knob");
+    for (var i = 0; i < stale.length; i++) stale[i].parentNode && stale[i].parentNode.removeChild(stale[i]);
+
     var MIN = 0.2, MAX = 2.0, PORT = 4381;
     var STORE = "spotispeed.rate";
     var LOG = Math.log(MAX / MIN);
