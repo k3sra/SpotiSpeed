@@ -374,6 +374,37 @@ static void ensureKnob() {
     wlog(needsKnobRepair() ? "re-apply did not take" : "knob restored");
 }
 
+// ---------------------------------------------------------------- CDP knob --
+// Spotify 1.2.99 stopped serving the local xpui folder and now fetches its UI
+// from xpui.app.spotify.com. Spicetify's extension slot never runs, so the
+// knob has to be injected through the DevTools protocol instead. A small
+// PowerShell script does that; the watcher just keeps one copy of it alive.
+static void spawnCdpInjector() {
+    // one at a time
+    HANDLE m = CreateMutexW(NULL, TRUE, L"Local\\SpotiSpeedCdp");
+    if (m != NULL && GetLastError() == ERROR_ALREADY_EXISTS) { CloseHandle(m); return; }
+
+    std::wstring ps1 = envPath(L"LOCALAPPDATA", L"\\SpotiSpeed\\spotispeed-cdp.ps1");
+    if (ps1.empty() || !PathFileExistsW(ps1.c_str())) {
+        wlog("cdp injector script not found: %ls", ps1.c_str());
+        return;
+    }
+    std::wstring cmd = L"powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"";
+    cmd += ps1; cmd += L"\"";
+
+    STARTUPINFOW si; ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi; ZeroMemory(&pi, sizeof(pi));
+    std::vector<wchar_t> mut(cmd.begin(), cmd.end()); mut.push_back(0);
+    if (CreateProcessW(NULL, mut.data(), NULL, NULL, FALSE,
+                       CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+        wlog("cdp injector spawned");
+    } else {
+        wlog("cdp injector spawn failed err=%lu", GetLastError());
+    }
+}
+
 // ------------------------------------------------------------------- main --
 static int run(int argc, wchar_t** argv) {
     bool watch = false, once = false;
@@ -415,6 +446,7 @@ static int run(int argc, wchar_t** argv) {
         return 0;
     }
     wlog("watcher started");
+    spawnCdpInjector();
 
     // pid -> attempt count, or -1 once that process is loaded / done with
     std::map<DWORD, int> seen;

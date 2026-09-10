@@ -1,5 +1,5 @@
-# Bakes the engine, watcher and knob into ONE self-contained .bat that can be
-# handed to anyone. Run this after build.bat.
+# Bakes the engine, watcher, knob script and CDP injector into ONE
+# self-contained .bat that can be handed to anyone. Run after build.bat.
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -12,6 +12,7 @@ function B64([string]$p) {
 $dll = B64 (Join-Path $root 'bin\spotispeed.dll')
 $exe = B64 (Join-Path $root 'bin\ssinject.exe')
 $js  = B64 (Join-Path $root 'ext\spotispeed.js')
+$ps1 = B64 (Join-Path $root 'ext\spotispeed-cdp.ps1')
 
 # ---------------------------------------------------------------- installer --
 $installer = @'
@@ -33,9 +34,8 @@ function Payload([string]$tag) {
 $HOME_  = Join-Path $env:LOCALAPPDATA 'SpotiSpeed'
 $SPOT   = Join-Path $env:APPDATA 'Spotify\Spotify.exe'
 $UPD    = Join-Path $env:LOCALAPPDATA 'Spotify\Update'
-$SPICE  = Join-Path $env:LOCALAPPDATA 'spicetify\spicetify.exe'
-$EXTDIR = Join-Path $env:APPDATA 'spicetify\Extensions'
 $RUNKEY = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+$FLAGS  = '--remote-debugging-port=4380 --remote-allow-origins=*'
 
 # --- 1. Spotify ------------------------------------------------------------
 if (-not (Test-Path $SPOT)) {
@@ -43,81 +43,84 @@ if (-not (Test-Path $SPOT)) {
 }
 Ok ("Found Spotify " + (Get-Item $SPOT).VersionInfo.FileVersion)
 
-# --- 2. Spicetify (draws the knob) -----------------------------------------
-if (-not (Test-Path $SPICE)) {
-    Say '[*] Installing Spicetify (needed to draw the knob)...'
-    try {
-        $prev = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
-        Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/spicetify/cli/main/install.ps1' |
-            Invoke-Expression
-        $ProgressPreference = $prev
-    } catch { Warn "Spicetify install failed: $($_.Exception.Message)" }
-}
-if (-not (Test-Path $SPICE)) {
-    Die "Spicetify could not be installed automatically.`n      Install it from https://spicetify.app/docs/getting-started then re-run this."
-}
-Ok 'Spicetify ready'
-
-# --- 3. stop everything ----------------------------------------------------
+# --- 2. stop everything ----------------------------------------------------
 Say '[*] Closing Spotify...'
 Get-Process Spotify, ssinject -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-    Where-Object { $_.CommandLine -match 'guardian\.ps1' } |
+    Where-Object { $_.CommandLine -match 'spotispeed-cdp|guardian\.ps1' } |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 Start-Sleep -Seconds 3
 
-# --- 4. unpack -------------------------------------------------------------
-Say '[*] Installing audio engine...'
+# --- 3. unpack -------------------------------------------------------------
+Say '[*] Installing audio engine and knob...'
 New-Item -ItemType Directory -Force $HOME_ | Out-Null
-[IO.File]::WriteAllBytes((Join-Path $HOME_ 'spotispeed.dll'), (Payload 'DLL'))
-[IO.File]::WriteAllBytes((Join-Path $HOME_ 'ssinject.exe'),   (Payload 'EXE'))
-[IO.File]::WriteAllBytes((Join-Path $HOME_ 'spotispeed.js'),  (Payload 'JS'))
-# leftovers from older versions
+[IO.File]::WriteAllBytes((Join-Path $HOME_ 'spotispeed.dll'),     (Payload 'DLL'))
+[IO.File]::WriteAllBytes((Join-Path $HOME_ 'ssinject.exe'),       (Payload 'EXE'))
+[IO.File]::WriteAllBytes((Join-Path $HOME_ 'spotispeed.js'),      (Payload 'JS'))
+[IO.File]::WriteAllBytes((Join-Path $HOME_ 'spotispeed-cdp.ps1'), (Payload 'PS1'))
 Remove-Item (Join-Path $HOME_ 'guardian.ps1') -Force -ErrorAction SilentlyContinue
-Ok "Engine installed to $HOME_"
+Ok "Files installed to $HOME_"
 
-# --- 4b. Marketplace (the shop icon, for installing other plugins) ----------
-# Optional and non-fatal: if it does not work out, the knob is unaffected.
-$MKT = Join-Path $env:APPDATA 'spicetify\CustomApps\marketplace'
-try {
-    if (-not (Test-Path (Join-Path $MKT 'manifest.json'))) {
-        Say '[*] Installing Spicetify Marketplace (the shop icon)...'
-        $prev = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
-        Invoke-WebRequest -UseBasicParsing `
-            'https://raw.githubusercontent.com/spicetify/marketplace/main/resources/install.ps1' |
-            Invoke-Expression
-        $ProgressPreference = $prev
-    }
-    if (Test-Path (Join-Path $MKT 'manifest.json')) {
-        # list-type config: this appends, it never clears what is already there
-        & $SPICE config custom_apps marketplace 2>&1 | Out-Null
-        Ok 'Marketplace ready (shop icon in the sidebar)'
-    } else {
-        Warn 'Marketplace not installed - the knob still works, you just will not get the shop icon'
-    }
-} catch { Warn "Marketplace step skipped: $($_.Exception.Message)" }
-
-# --- 5. the knob -----------------------------------------------------------
-Say "[*] Adding the knob to Spotify's footer..."
-New-Item -ItemType Directory -Force $EXTDIR | Out-Null
-Copy-Item (Join-Path $HOME_ 'spotispeed.js') $EXTDIR -Force
-& $SPICE config extensions spotispeed.js 2>&1 | Out-Null
-# apply first: "backup apply" on an already-patched client would snapshot the
-# patched bundle as though it were pristine
-& $SPICE apply 2>&1 | Out-Null
-$index = Join-Path $env:APPDATA 'Spotify\Apps\xpui\index.html'
-$patched = (Test-Path $index) -and ((Get-Content $index -Raw) -match 'spicetifyWrapper')
-if (-not $patched) {
-    & $SPICE backup apply 2>&1 | Out-Null
-    $patched = (Test-Path $index) -and ((Get-Content $index -Raw) -match 'spicetifyWrapper')
+# --- 4. patch Spotify launch flags -----------------------------------------
+# The 1.2.99+ Spotify serves its UI from xpui.app.spotify.com and ignores the
+# local xpui folder, so the old Spicetify extension slot never runs. The knob
+# gets injected through Spotify's DevTools port instead - which only works if
+# Spotify is launched with --remote-debugging-port. Patch every shortcut and
+# the autostart Run key so any launch path gets the flags.
+function AddFlags([string]$existing) {
+    $a = $existing
+    if ($a -notmatch '--remote-debugging-port=')  { $a = ($a + ' --remote-debugging-port=4380').Trim() }
+    if ($a -notmatch '--remote-allow-origins=')   { $a = ($a + ' --remote-allow-origins=*').Trim() }
+    return $a
 }
-if ($patched) { Ok 'Knob added' } else { Warn 'Spicetify could not patch this Spotify build - speed still works, but the knob may not show' }
+function PatchLnk([string]$lnkPath) {
+    if (-not (Test-Path $lnkPath)) { return $false }
+    try {
+        $sh = New-Object -ComObject WScript.Shell
+        $l = $sh.CreateShortcut($lnkPath)
+        if ([string]::IsNullOrEmpty($l.TargetPath)) { return $false }
+        if (-not ($l.TargetPath -match 'Spotify\.exe$|SpotifyLauncher\.exe$')) { return $false }
+        # SpotifyLauncher.exe swallows the flags; retarget those shortcuts at
+        # Spotify.exe directly so the flags actually reach the browser process.
+        if ($l.TargetPath -match 'SpotifyLauncher\.exe$') { $l.TargetPath = $SPOT }
+        $l.Arguments = AddFlags $l.Arguments
+        $l.Save()
+        return $true
+    } catch { return $false }
+}
+Say '[*] Adding DevTools port to Spotify launch shortcuts...'
+$lnks = @(
+    (Join-Path $env:APPDATA  'Microsoft\Windows\Start Menu\Programs\Spotify.lnk')
+    (Join-Path $env:PUBLIC   'Desktop\Spotify.lnk')
+    (Join-Path $env:USERPROFILE 'Desktop\Spotify.lnk')
+    (Join-Path $env:APPDATA  'Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar\Spotify.lnk')
+    (Join-Path $env:APPDATA  'Microsoft\Internet Explorer\Quick Launch\Spotify.lnk')
+)
+$hit = 0
+foreach ($p in $lnks) { if (PatchLnk $p) { $hit++ } }
+if ($hit -gt 0) { Ok "Patched $hit Spotify shortcut(s)" } else { Warn 'No Spotify shortcuts found to patch (start menu tile may still need manual restart)' }
 
-# --- 6. freeze the client --------------------------------------------------
+# If Spotify's own autostart is registered, patch it too.
+try {
+    $sp = (Get-ItemProperty -Path $RUNKEY -Name 'Spotify' -ErrorAction SilentlyContinue).Spotify
+    if ($sp) {
+        # split "exe" args
+        $m = [regex]::Match($sp, '^\s*("([^"]+)"|(\S+))\s*(.*)$')
+        if ($m.Success) {
+            $exePart = if ($m.Groups[2].Success) { '"' + $m.Groups[2].Value + '"' } else { $m.Groups[3].Value }
+            $args    = $m.Groups[4].Value
+            $newVal  = ($exePart + ' ' + (AddFlags $args)).Trim()
+            if ($newVal -ne $sp) {
+                Set-ItemProperty -Path $RUNKEY -Name 'Spotify' -Value $newVal -Force
+                Ok 'Patched Spotify autostart entry'
+            }
+        }
+    }
+} catch {}
+
+# --- 5. freeze the client --------------------------------------------------
 Say '[*] Blocking Spotify auto-update...'
 try {
-    # An older SpotiSpeed put a deny ACE on this path, which would stop us
-    # rewriting it now. Clear any inherited weirdness before touching it.
     if (Test-Path -LiteralPath $UPD) { icacls $UPD /reset 2>&1 | Out-Null }
     if (Test-Path -LiteralPath $UPD -PathType Container) { Remove-Item -LiteralPath $UPD -Recurse -Force }
     if (Test-Path -LiteralPath $UPD -PathType Leaf) {
@@ -127,22 +130,16 @@ try {
     New-Item -ItemType File -Path $UPD -Force | Out-Null
     (Get-Item -LiteralPath $UPD -Force).Attributes = 'ReadOnly, Hidden'
 } catch { }
-# What matters is the end state, not which step complained: a *file* on that
-# path means the updater has nowhere to unpack.
 $blocked = (Test-Path -LiteralPath $UPD -PathType Leaf)
 if ($blocked) { Ok 'Auto-update blocked (this Spotify build is now frozen)' }
 else { Warn 'Could not block updates - Spotify may replace itself later' }
 
-# --- 7. autostart ----------------------------------------------------------
-# The Run key, not the Startup folder. The Startup folder is silently skipped on
-# some machines, which is exactly how the knob ended up dead after a reboot.
-# This is the same mechanism Spotify uses for its own autostart.
+# --- 6. our autostart ------------------------------------------------------
 Say '[*] Setting up autostart...'
 $watchCmd = '"' + (Join-Path $HOME_ 'ssinject.exe') + '" --watch "' + (Join-Path $HOME_ 'spotispeed.dll') + '"'
 try {
     New-Item -Path $RUNKEY -Force -ErrorAction SilentlyContinue | Out-Null
     Set-ItemProperty -Path $RUNKEY -Name 'SpotiSpeed' -Value $watchCmd -Force
-    # retire the old, unreliable chain
     Remove-Item (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup\SpotiSpeed.vbs') -Force -ErrorAction SilentlyContinue
     schtasks /Delete /TN 'SpotiSpeed' /F 2>&1 | Out-Null
     $back = (Get-ItemProperty -Path $RUNKEY -Name 'SpotiSpeed' -ErrorAction Stop).SpotiSpeed
@@ -150,18 +147,26 @@ try {
     else { Warn 'Autostart entry did not verify' }
 } catch { Warn "Could not register autostart: $($_.Exception.Message)" }
 
-# --- 8. go -----------------------------------------------------------------
+# --- 7. go -----------------------------------------------------------------
 Say '[*] Starting engine and Spotify...'
 Start-Process -FilePath (Join-Path $HOME_ 'ssinject.exe') `
               -ArgumentList '--watch', ('"' + (Join-Path $HOME_ 'spotispeed.dll') + '"')
 Start-Sleep -Seconds 2
-Start-Process $SPOT
-Start-Sleep -Seconds 8
+Start-Process -FilePath $SPOT -ArgumentList '--remote-debugging-port=4380','--remote-allow-origins=*'
+Start-Sleep -Seconds 10
 
 $live = $false
 try { $live = ((Invoke-WebRequest 'http://127.0.0.1:4381/speed' -TimeoutSec 4 -UseBasicParsing).Content -match '"hooked":true') } catch {}
 if ($live) { Ok 'Engine is live and hooked into Spotify' }
 else { Warn 'Engine has not reported in yet - it usually catches up within a few seconds' }
+
+$knob = $false
+try {
+    $t = Invoke-RestMethod 'http://127.0.0.1:4380/json' -TimeoutSec 3 -ErrorAction Stop
+    $knob = ($t | Where-Object { $_.type -eq 'page' -and $_.url -match 'xpui' }).Count -gt 0
+} catch {}
+if ($knob) { Ok 'Spotify DevTools port responding - knob will appear shortly' }
+else { Warn 'DevTools port did not answer - if the knob does not appear, close Spotify fully and open it from the Start menu' }
 
 Write-Host
 Ok 'SpotiSpeed is installed.'
@@ -211,6 +216,7 @@ $installer
 #DLL#$dll#/DLL#
 #EXE#$exe#/EXE#
 #JS#$js#/JS#
+#PS1#$ps1#/PS1#
 "@
 
 $out = Join-Path $root 'SpotiSpeed-Setup.bat'

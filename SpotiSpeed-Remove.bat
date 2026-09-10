@@ -17,9 +17,24 @@ del /F /Q "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\SpotiSpeed.vb
 schtasks /Delete /TN "SpotiSpeed" /F >nul 2>&1
 taskkill /F /IM ssinject.exe >nul 2>&1
 taskkill /F /IM Spotify.exe  >nul 2>&1
+
+rem stop the CDP knob injector (a background powershell running our script)
+powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -match 'spotispeed-cdp' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1
 ping 127.0.0.1 -n 4 >nul
 
-echo    [*] Removing the knob...
+echo    [*] Removing DevTools flags from Spotify shortcuts...
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$s=New-Object -ComObject WScript.Shell;" ^
+  "@((Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Spotify.lnk')," ^
+  "  (Join-Path $env:PUBLIC 'Desktop\Spotify.lnk')," ^
+  "  (Join-Path $env:USERPROFILE 'Desktop\Spotify.lnk')," ^
+  "  (Join-Path $env:APPDATA 'Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar\Spotify.lnk')," ^
+  "  (Join-Path $env:APPDATA 'Microsoft\Internet Explorer\Quick Launch\Spotify.lnk'))" ^
+  " | Where-Object { Test-Path $_ } | ForEach-Object {" ^
+  "    try { $l=$s.CreateShortcut($_); $l.Arguments = ($l.Arguments -replace '--remote-debugging-port=\d+','' -replace '--remote-allow-origins=\S+','').Trim(); $l.Save() } catch {}" ^
+  "  }" >nul 2>&1
+
+echo    [*] Removing the knob (spicetify path, if used)...
 if exist "%SPICE%" (
   "%SPICE%" config extensions spotispeed.js- >nul 2>&1
   "%SPICE%" apply >nul 2>&1
